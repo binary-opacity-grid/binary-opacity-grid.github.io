@@ -1,64 +1,6 @@
 /**
- * @fileoverview Miscellaneous utilities for the webviewer.
+ * @fileoverview Utility functions for file loading and more.
  */
-
-/**
- * Number of textures being fetched.
- * @type {number}
- */
-let gNumTextures = 0;
-
-/**
- * Number of already loaded textures.
- * @type {number}
- */
-let gLoadedTextures = 0;
-
-/**
- * Allows forcing specific submodel for debugging
- */
-let gSubmodelForceIndex = -1;
-
-
-/**
- * Extends a dictionary.
- * @param {!object} obj Dictionary to extend
- * @param {!object} src Dictionary to be written into obj
- * @return {!object} Extended dictionary
- */
-function extend(obj, src) {
-  for (let key in src) {
-    if (src.hasOwnProperty(key)) obj[key] = src[key];
-  }
-  return obj;
-}
-
-
-/**
- * Reports an error to the user by populating the error div with text.
- * @param {string} text
- */
-function error(text) {
-  const e = document.getElementById('error');
-  e.textContent = text;
-  e.style.display = 'block';
-}
-
-
-/**
- * Creates a DOM element that belongs to the given CSS class.
- * @param {string} what
- * @param {string} className
- * @return {!HTMLElement}
- */
-function create(what, className) {
-  const e = /** @type {!HTMLElement} */ (document.createElement(what));
-  if (className) {
-    e.className = className;
-  }
-  return e;
-}
-
 
 /**
  * Formats the integer i as a string with "min" leading zeroes.
@@ -75,43 +17,298 @@ function digits(i, min) {
   }
 }
 
-
-function setupViewport(width, height) {
-  gViewportDims = [width, height];
-}
-
-
 /**
- * Equivalent to range(n) in Python.
+ * Updates the loading progress HTML elements.
  */
-function range(n) {
-  return [...Array(n).keys()];
-}
-
-
-/**
- * Product of a set of numbers.
- * @param {array} xs
- * @return {number}
- */
-function product(xs) {
-  result = 1;
-  for (let x of xs) {
-    result *= x;
+function updateLoadingProgress() {
+  let imageProgress = document.getElementById('image-progress');
+  if (gTotalBytesToDecode) {
+    let progress = 100 * gBytesDecoded / gTotalBytesToDecode;
+    progress = progress.toFixed(1);
+    imageProgress.innerHTML = 'Progress: ' + progress + '%';
+  } else {
+    let gMebibytesDecoded = gBytesDecoded / (1024 * 1024);
+    gMebibytesDecoded = gMebibytesDecoded.toFixed(1);
+    imageProgress.innerHTML = ' Decoded: ' + gMebibytesDecoded + ' MiB';
   }
-  return result;
 }
 
 
 /**
- * Sum of a set of numbers
+ * Returns a promise that fires within a specified amount of time. Can be used
+ * in an asynchronous function for sleeping.
+ * @param {number} milliseconds Amount of time to sleep
+ * @return {!Promise}
  */
-function sum(xs) {
-  result = 1;
-  for (let x of xs) {
-    result += x;
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+/**
+ * Safe fetching. Some servers restrict the number of requests and
+ * respond with status code 429 ("Too Many Requests") when a threshold
+ * is exceeded. When we encounter a 429 we retry after a short waiting period.
+ * @param {!object} fetchFn Function that fetches the file.
+ * @return {!Promise} Returns fetchFn's response.
+ */
+async function fetchAndRetryIfNecessary(fetchFn) {
+  const response = await downloadFileWithProgress(fetchFn);
+  if (response.status === 429) {
+    await sleep(500);
+    return fetchAndRetryIfNecessary(fetchFn);
   }
-  return result;
+  return response;
+}
+
+/**
+ * Downloads a file while maintaining progress.
+ * @param {!object} fetchFn Function that fetches the file.
+ * @return {!Promise} Returns fetchFn's response.
+ */
+async function downloadFileWithProgress(fetchFn) {
+  try {
+    const response = await fetchFn();
+    if (!response.ok) {
+      throw new Error('Network response was not ok');
+    }
+    const reader = response.body.getReader();
+
+    let outputStream = new ReadableStream({
+      start(controller) {
+        async function read() {
+          try {
+            const {done, value} = await reader.read();
+            if (done) {
+              controller.close();
+              return;
+            }
+
+            gBytesDecoded += value.byteLength;
+            updateLoadingProgress();
+
+            controller.enqueue(value);
+            read();
+          } catch (error) {
+            console.error('Error reading the stream:', error);
+            controller.error(error);
+          }
+        }
+        read();
+      }
+    });
+    return new Response(outputStream);
+  } catch (error) {
+    console.error('Error downloading the file:', error);
+    throw error;
+  }
+}
+
+/**
+ * Loads PNG image from rgbaURL and decodes it to an Uint8Array.
+ * @param {string} rgbaUrl The URL of the PNG image.
+ * @return {!Promise<!Uint8Array>}
+ */
+function loadPNG(rgbaUrl) {
+  let fetchFn = () => fetch(rgbaUrl, {method: 'GET', mode: 'cors'});
+  const rgbaPromise = fetchAndRetryIfNecessary(fetchFn)
+                          .then(response => {
+                            return response.arrayBuffer();
+                          })
+                          .then(buffer => {
+                            let data = new Uint8Array(buffer);
+                            let pngDecoder = new PNG(data);
+                            let pixels = pngDecoder.decodePixels();
+                            return pixels;
+                          });
+  rgbaPromise.catch(error => {
+    console.error(
+        'Could not load PNG image from: ' + rgbaUrl + ', error: ' + error);
+    return;
+  });
+  return rgbaPromise;
+}
+
+/**
+ * Loads binary file from url and decodes it to an Uint8Array.
+ * @param {string} url The URL of the binary file.
+ * @return {!Promise<!Uint8Array>}
+ */
+function loadBinaryFile(url) {
+  let fetchFn = () => fetch(url, {
+    method: 'GET',
+    mode: 'cors',
+  });
+
+  const promise = fetchAndRetryIfNecessary(fetchFn)
+                      .then(response => {
+                        return response.arrayBuffer();
+                      })
+                      .then(buffer => {
+                        let data = new Uint8Array(buffer);
+                        return data;
+                      });
+  promise.catch(error => {
+    console.error(
+        'Could not load binary file from: ' + url + ', error: ' + error);
+    return;
+  });
+  return promise;
+}
+
+/**
+ * Loads a text file.
+ * @param {string} url URL of the file to be loaded.
+ * @return {!Promise<string>}
+ */
+function loadTextFile(url) {
+  let fetchFn = () => fetch(url, {
+    method: 'GET',
+    mode: 'cors',
+  });
+  return fetchAndRetryIfNecessary(fetchFn).then(response => response.text());
+}
+
+/**
+ * Loads and parses a JSON file.
+ * @param {string} url URL of the file to be loaded.
+ * @return {!Promise<!object>} The parsed JSON file.
+ */
+function loadJSONFile(url) {
+  let fetchFn = () => fetch(url, {method: 'GET', mode: 'cors'});
+  return fetchAndRetryIfNecessary(fetchFn).then(response => response.json());
+}
+
+/**
+ * Loads a GLB mesh file.
+ * @param {string} url URL of the file to be loaded.
+ * @return {!Promise<!object>} The parsed GLTF scene.
+ */
+function loadMesh(url) {
+  return new Promise((resolve, reject) => {
+    let loader = new THREE.GLTFLoader();
+    let previouslyLoaded = 0;
+    loader.load(
+        url,
+        (gltf) => {
+          resolve(gltf);
+        },
+        (xhr) => {
+          let deltaLoaded = xhr.loaded - previouslyLoaded;
+          gBytesDecoded += deltaLoaded;
+          previouslyLoaded = xhr.loaded;
+          updateLoadingProgress();
+        },
+        (error) => {
+          console.log(error);
+          reject(error);
+        });
+  });
+}
+
+/**
+ * Calculates PSNR for a given pair of images.
+ * @param {!Uint8Array} original The reference image.
+ * @param {!Uint8Array} compressed The degraded image.
+ * @param {number=} maxPixelValue Maximum pixel value. Defaults to 255.
+ * @return {number} PSNR value.
+ */
+function calculatePSNR(original, compressed, maxPixelValue = 255) {
+  if (original.length !== compressed.length) {
+    throw new Error('Input arrays must have the same length.');
+  }
+  let mse = 0;
+  for (let i = 0; i < original.length; i++) {
+    mse += Math.pow(original[i] - compressed[i], 2);
+  }
+  mse /= original.length;
+  if (mse === 0) {
+    return Infinity;  // PSNR is infinite for identical images
+  }
+  let psnr = 10 * Math.log10(Math.pow(maxPixelValue, 2) / mse);
+  return psnr;
+}
+
+/**
+ * Calculates the average for a given array of numbers.
+ * @param {!object} arr Array of numbers.
+ * @return {number} The average value.
+ */
+function calculateAverage(arr) {
+  if (arr.length === 0) {
+    return 0;
+  }
+  let sum = arr.reduce(function(total, currentValue) {
+    return total + currentValue;
+  }, 0);
+  let average = sum / arr.length;
+  return average;
+}
+
+/**
+ * Obtain the parameters that were used to construct a projection matrix.
+ * Assumes a WebGL-style matrix. WebGPU matrices are not supported.
+ * @param {!THREE.Matrix4} projectionMatrix The projection matrix that is going
+ *  to be modified in-place.
+ * @return {!object} An object containing left, right, top, bottom, near, far.
+ */
+function getPerspectiveParameters(projectionMatrix) {
+  // Obtain inputs.
+  const te = projectionMatrix.elements;
+  const x = te[0];
+  const y = te[5];
+  const a = te[8];
+  const b = te[9];
+  const c = te[10];
+  const d = te[14];
+
+  // Compute outputs.
+  const near = (d / (c - 1));
+  const far = (d / (c + 1));
+  const left = (a - 1) / x * near;
+  const right = (a + 1) / x * near;
+  const top = (b + 1) / y * near;
+  const bottom = (b - 1) / y * near;
+
+  return {left, right, top, bottom, near, far};
+}
+
+/**
+ * Adjusts only the near value of a projection matrix in-place.
+ * @param {!THREE.Matrix4} projectionMatrix The projection matrix that is going
+ *  to be modified in-place.
+ * @param {number} newNear New near value.
+ */
+function adjustNearValueOfProjectionMatrix(projectionMatrix, newNear) {
+  let params = getPerspectiveParameters(projectionMatrix);
+  let r = newNear / params.near;
+  projectionMatrix.makePerspective(
+      params.left * r, params.right * r, params.top * r, params.bottom * r,
+      newNear, params.far);
+}
+
+/**
+ * Creates a DOM element that belongs to the given CSS class.
+ * @param {string} what
+ * @param {string} classname
+ * @return {!HTMLElement}
+ */
+function create(what, classname) {
+  const e = /** @type {!HTMLElement} */ (document.createElement(what));
+  if (classname) {
+    e.className = classname;
+  }
+  return e;
+}
+
+/**
+ * Reports an error to the user by populating the error div with text.
+ * @param {string} text
+ */
+function error(text) {
+  const e = document.getElementById('Loading');
+  e.textContent = 'Error: ' + text;
+  e.style.display = 'block';
+  hideLoading();
 }
 
 
@@ -126,7 +323,6 @@ function setDims(element, width, height) {
   element.style.height = height.toFixed(2) + 'px';
 }
 
-
 /**
  * Hides the loading prompt.
  */
@@ -138,55 +334,6 @@ function hideLoading() {
   loadingContainer.style.display = 'none';
 }
 
-
-/** Show the loading prompt */
-function showLoading() {
-  let loading = document.getElementById('Loading');
-  loading.style.display = 'block';
-
-  let loadingContainer = document.getElementById('loading-container');
-  loadingContainer.style.display = 'block';
-}
-
-
-/**
- * Returns true if the scene is still loading.
- */
-function isLoading() {
-  const loading = document.getElementById('Loading');
-  return loading.style.display !== 'none';
-}
-
-
-/**
- * Executed whenever an image is loaded for updating the loading prompt.
- */
-function onImageFetch(value) {
-  gNumTextures++;
-  updateLoadingProgress();
-  return value;
-}
-
-/**
- * Executed whenever an image is loaded for updating the loading prompt.
- */
-function onImageLoaded(value) {
-  gLoadedTextures++;
-  updateLoadingProgress();
-  return value;
-}
-
-/**
- * Updates the loading progress HTML elements.
- */
-function updateLoadingProgress() {
-  let imageProgress = document.getElementById('image-progress');
-  const numTexturesString = gNumTextures > 0 ? gNumTextures : '?';
-  imageProgress.innerHTML =
-      'Loading images: ' + gLoadedTextures + '/' + numTexturesString;
-}
-
-
 /**
  * Checks whether the WebGL context is valid and the underlying hardware is
  * powerful enough. Otherwise displays a warning.
@@ -195,7 +342,7 @@ function updateLoadingProgress() {
 function isRendererUnsupported() {
   let loading = document.getElementById('Loading');
 
-  let gl = document.getElementsByTagName('canvas')[0].getContext('webgl2');
+  let gl = gRenderer.getContext();
   if (!gl) {
     loading.innerHTML = 'Error: WebGL2 context not found. Is your machine' +
         ' equipped with a discrete GPU?';
@@ -210,318 +357,3 @@ function isRendererUnsupported() {
   }
   return false;
 }
-
-
-/**
- * Returns a promise that fires within a specified amount of time. Can be used
- * in an asynchronous function for sleeping.
- * @param {number} milliseconds Amount of time to sleep
- * @return {!Promise}
- */
-function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-
-/**
- * Given a submodel index, returns path to its scene_params.json file.
- *
- * @param {number} submodelId Submodel index.
- * @param {string} assetName Optional filename.
- * @return {string} Path to submodel assets.
- */
-function submodelAssetPath(submodelId, assetName) {
-  let prefix = '';
-  if (gUseSubmodel) {
-    const smIdx = String(submodelId).padStart(3, '0');
-    prefix = `../sm_${smIdx}`;
-    if (assetName == undefined) {
-      return prefix;
-    }
-    return `${prefix}/${assetName}`;
-  }
-  return assetName;
-}
-
-
-/**
- * Determines appropriate submodel index for a position in world coordinates.
- */
-function positionToSubmodel(xyz, sceneParams) {
-  if (gUseSubmodel == false) {
-    return 0;
-  }
-  if (gSubmodelForceIndex >= 0) {
-    return gSubmodelForceIndex;
-  }
-  let fixed_xyz = new THREE.Vector3(-xyz.x, xyz.z, xyz.y);
-  let voxel_resolution = 2 / sceneParams['submodel_voxel_size'];
-  let x_grid = fixed_xyz.addScalar(1.0).divideScalar(2.0);
-  x_grid = x_grid.multiplyScalar(voxel_resolution);
-  let x_floor = x_grid.floor().clampScalar(0, voxel_resolution - 1);
-
-  const linear_index =
-      (x_floor.x * voxel_resolution + x_floor.y) * voxel_resolution + x_floor.z;
-  return sceneParams['sm_to_params'][linear_index];
-}
-
-
-/**
- * Computes center of submodel in world coordinates.
- */
-function submodelCenter(submodelId, sceneParams) {
-  if (gUseSubmodel == false) {
-    return new THREE.Vector3(0.0, 0.0, 0.0);
-  }
-
-  /* The submodels are ordered through z, y then x from negative to positive */
-  let submodelVoxelSize = sceneParams['submodel_voxel_size'];
-  let voxel_resolution = 2 / submodelVoxelSize;
-
-  let submodelIndex = sceneParams['params_to_sm'][submodelId];
-  let z_index = submodelIndex % voxel_resolution;
-  let y_index =
-      ((submodelIndex - z_index) / voxel_resolution) % voxel_resolution;
-  let x_index =
-      ((submodelIndex - z_index - y_index * voxel_resolution) /
-       voxel_resolution / voxel_resolution);
-
-  /* reorder for coordinate systems */
-  x_index = voxel_resolution - 1 - x_index;
-  [y_index, z_index] = [z_index, y_index];
-
-  return new THREE.Vector3(
-      (x_index + 0.5) * submodelVoxelSize - 1.0,
-      (y_index + 0.5) * submodelVoxelSize - 1.0,
-      (z_index + 0.5) * submodelVoxelSize - 1.0);
-}
-
-
-
-/**
- * Creates transform matrix from world coordinates to submodel coordinates.
- */
-function submodelTransform(submodelId, sceneParams) {
-  const submodel_position = submodelCenter(submodelId, sceneParams);
-  const submodel_scale = sceneParams['submodel_scale'];
-
-  let submodel_scale_matrix = new THREE.Matrix4();
-  submodel_scale_matrix.makeScale(
-      submodel_scale, submodel_scale, submodel_scale);
-  let submodel_translate_matrix = new THREE.Matrix4();
-  submodel_translate_matrix.makeTranslation(
-      -submodel_position.x, -submodel_position.y, -submodel_position.z);
-  submodel_matrix = new THREE.Matrix4();
-  submodel_matrix.multiplyMatrices(
-      submodel_scale_matrix, submodel_translate_matrix);
-
-  return submodel_matrix;
-}
-
-
-/**
- * Safe fetching. Some servers restrict the number of requests and
- * respond with status code 429 ("Too Many Requests") when a threshold
- * is exceeded. When we encounter a 429 we retry after a short waiting period.
- * @param {!object} fetchFn Function that fetches the file.
- * @return {!Promise} Returns fetchFn's response.
- */
-async function fetchAndRetryIfNecessary(fetchFn) {
-  const response = await fetchFn();
-  if (response.status === 429) {
-    await sleep(500);
-    return fetchAndRetryIfNecessary(fetchFn);
-  }
-  return response;
-}
-
-
-/**
- * Loads binary asset from rgbaURL and decodes it to an Uint8Array.
- * @param {string} rgbaUrl The URL of the asset image.
- * @return {!Promise<!Uint8Array>}
- */
-function loadAsset(rgbaUrl) {
-  const result = new Promise((resolve) => {
-    gLoadAssetsWorker.submit({url: rgbaUrl}, resolve);
-  });
-  return result;
-}
-
-
-/**
- * Merge slices into a single array with a web worker.
- */
-function mergeSlices(asset, src, dst) {
-  // Wait for all assets to arrive.
-  let promises = asset.sliceAssets.map((sliceAsset) => sliceAsset.asset);
-
-  // Nearly all calls to this function merge a list of assets sliced along the
-  // depth dimension. The only exception to this is sparse grid density, which
-  // must merge from >1 sources.
-
-  let result = Promise.all(promises).then((rawAssets) => {
-    // Replace promises with their actual values
-    let rawSliceAssets = range(rawAssets.length).map((i) => {
-      return {
-        ...asset.sliceAssets[i],
-        asset: rawAssets[i],
-      };
-    });
-    // Forward request to worker.
-    let rawAsset = {...asset, sliceAssets: rawSliceAssets};
-    let request = {asset: rawAsset, src: src, dst: dst, fn: 'mergeSlices'};
-    return new Promise((resolve) => {
-      gCopySliceWorker.submit(request, resolve);
-    });
-  });
-
-  return result;
-}
-
-
-/**
- * Merge slices of sparse grid density into a single array.
- */
-function mergeSparseGridDensity(asset) {
-  // Wait for all assets to arrive.
-  let getAssetPromises = (assetSlices) =>
-      Promise.all(assetSlices.sliceAssets.map((sliceAsset) => sliceAsset.asset));
-  let rgbAndDensityPromise = getAssetPromises(asset.rgbAndDensityAsset);
-  let featuresPromise = getAssetPromises(asset.featuresAsset);
-  let promises = [rgbAndDensityPromise, featuresPromise];
-
-  // Nearly all calls to this function merge a list of assets sliced along the
-  // depth dimension. The only exception to this is sparse grid density, which
-  // must merge from >1 sources.
-
-  let result = Promise.all(promises).then((result) => {
-    let rawRgbAndDensitySliceAssets = result[0];
-    let rawFeaturesSliceAssets = result[1];
-
-    // Replace promises with their actual values
-    let reassembleSliceAssets = (originalSliceAsset, rawSliceAssets) => {
-      let numSliceAssets = rawSliceAssets.length;
-      let sliceAssets = range(numSliceAssets).map((i) => {
-        return {...originalSliceAsset.sliceAssets[i], asset: rawSliceAssets[i]};
-      });
-      return {...originalSliceAsset, sliceAssets: sliceAssets};
-    };
-    let rawRgbAndDensityAsset = reassembleSliceAssets(
-        asset.rgbAndDensityAsset, rawRgbAndDensitySliceAssets);
-    let rawFeaturesAsset =
-        reassembleSliceAssets(asset.featuresAsset, rawFeaturesSliceAssets);
-
-    // Forward request to worker.
-    let rawAsset = {
-      assetType: asset.assetType,
-      rgbAndDensityAsset: rawRgbAndDensityAsset,
-      featuresAsset: rawFeaturesAsset,
-    };
-    let request = {
-      asset: rawAsset,
-      fn: 'mergeSparseGridDensity',
-    };
-    return new Promise((resolve) => {
-      gCopySliceWorker.submit(request, resolve);
-    });
-  });
-
-  return result;
-}
-
-
-/**
- * Get a field's value or return a default value.
- */
-function getFieldOrDefault(obj, field, default_) {
-  let result = obj[field];
-  if (result == undefined) {
-    return default_;
-  }
-  return result;
-}
-
-
-/**
- * Loads a text file.
- * @param {string} url URL of the file to be loaded.
- * @return {!Promise<string>}
- */
-function loadTextFile(url) {
-  let fetchFn = () => fetch(url, {method: 'GET', mode: 'cors'});
-  return fetchAndRetryIfNecessary(fetchFn).then(response => response.text());
-}
-
-
-/**
- * Loads and parses a JSON file.
- * @param {string} url URL of the file to be loaded
- * @return {!Promise<!object>} The parsed JSON file
- */
-function loadJSONFile(url) {
-  let fetchFn = () => fetch(url, {method: 'GET', mode: 'cors'});
-  return fetchAndRetryIfNecessary(fetchFn).then(response => response.json());
-}
-
-
-/**
- * Translates filenames to links.
- */
-class Router {
-  /**
-   * Constructor.
-   * @param {string} dirUrl The url where scene files are stored.
-   * @param {?object} filenameToLink Dictionary that maps internal file names to
-   *     download links.
-   */
-  constructor(dirUrl, filenameToLink) {
-    this.dirUrl = dirUrl;
-    this.filenameToLink = filenameToLink;
-  }
-
-  /**
-   * Maps a virtual filename to an URL.
-   * @param {string} filename Internal filename.
-   * @return {string} Download URL.
-   */
-  translate(filename) {
-    if (this.filenameToLink != null) {
-      // Lookup download URL in map.
-      return this.filenameToLink[filename];
-    } else {
-      // Simply preprend directory.
-      return this.dirUrl + '/' + filename;
-    }
-  }
-}
-
-
-/** Format of a texture */
-const Format = {
-  RED: { numChannels: 1 },
-  LUMINANCE_ALPHA: { numChannels: 2 },
-  RGB: { numChannels: 3 },
-  RGBA: { numChannels: 4 },
-};
-
-/** Where to copy inputs from */
-const GridTextureSource = {
-  RGBA_FROM_RGBA: {format: Format.RGBA, channels: [0, 1, 2, 3]},
-  RGB_FROM_RGBA: {format: Format.RGBA, channels: [0, 1, 2]},
-  RGB_FROM_RGB: {format: Format.RGB, channels: [0, 1, 2]},
-  ALPHA_FROM_RGBA: {format: Format.RGBA, channels: [3]},
-  RED_FROM_RED: {format: Format.RED, channels: [0]},
-  LA_FROM_LUMINANCE_ALPHA: {format: Format.LUMINANCE_ALPHA, channels: [0, 1]},
-};
-
-
-/** Where to copy outputs to. **/
-const GridTextureDestination = {
-  RED_IN_RED: { format: Format.RED, channels: [0]},
-  RGB_IN_RGB: { format: Format.RGB, channels: [0, 1, 2] },
-  RGBA_IN_RGBA: { format: Format.RGBA, channels: [0, 1, 2, 3] },
-  LA_IN_LUMINANCE_ALPHA: { format: Format.LUMINANCE_ALPHA, channels: [0, 1] },
-  LUMINANCE_IN_LUMINANCE_ALPHA: { format: Format.LUMINANCE_ALPHA, channels: [0] },
-  ALPHA_IN_LUMINANCE_ALPHA: { format: Format.LUMINANCE_ALPHA, channels: [1] },
-};
